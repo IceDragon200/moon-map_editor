@@ -1,0 +1,8 @@
+set pkgdir: 'packages'
+
+# Standard Library
+pkg 'std'
+# Data Mmodel
+pkg 'data_model'
+# Nanovg UI
+pkg 'nui'
