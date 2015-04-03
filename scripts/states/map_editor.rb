@@ -60,29 +60,38 @@ class Color
 end
 
 module Renderable
-  @@vg = nil
-
-  def post_init
-    super
-    @@vg ||= NVG::Context.new
+  class << self
+    attr_accessor :vg
   end
 
   def vg
-    @@vg
+    Renderable.vg
+  end
+
+  def render(rect, options = {})
   end
 end
 
 # Module for adding tagging capabilities to Objects, the object in question
 # must implement a tags accessor, which is normally an Array of Strings.
 module Taggable
+  # Adds new tags to the object
+  #
+  # @param [String] tgs
   def tag(*tgs)
     tags.concat tgs
   end
 
+  # Removes tags from the object
+  #
+  # @param [String] tgs
   def untag(*tgs)
     self.tags -= tgs
   end
 
+  # Checks if the object includes the tags
+  #
+  # @param [String] tgs
   def tagged?(*tgs)
     tags.include_slice?(tgs)
   end
@@ -96,11 +105,9 @@ class BaseObject < Moon::DataModel::Metal
 
   def update(delta)
   end
-
-  def render(rect, options = {})
-  end
 end
 
+# Offseting view
 class View < BaseObject
   field :offset, type: Moon::Vector2, default: proc { Moon::Vector2.zero }
   field :child,  type: Renderable,    default: nil
@@ -114,32 +121,86 @@ class View < BaseObject
   end
 end
 
+# Grid overlay for the screen
 class GridOverlay < BaseObject
+  field :reso,  type: Moon::Vector2, default: proc { Moon::Vector2.new(8, 8) }
   field :color, type: NVG::Color, default: proc { NVG.mono(0) }
 
   def render(rect, options = {})
     x, y, w, h = *rect
     x2 = x + w
     y2 = y + h
-    vg.draw w, h, 1.0 do |v|
-      cols = w.divceil(16)
-      rows = h.divceil(16)
-      v.stroke_color @color
-      cols.times do |xx|
-        col = x + xx * 16
-        v.move_to col, y
-        v.line_to col, y2
+    cols = w.divceil(reso.x)
+    rows = h.divceil(reso.y)
+    vg.draw w, h, 1.0 do
+      vg.stroke_color @color
+      vg.stroke_width 1
+      vg.path do
+        cols.times do |xx|
+          col = x + xx * reso.x
+          vg.move_to col, y
+          vg.line_to col, y2
+        end
+        rows.times do |yy|
+          row = y + yy * reso.y
+          vg.move_to x, row
+          vg.line_to x2, row
+        end
+        vg.stroke
       end
-      rows.times do |yy|
-        row = y + yy * 16
-        v.move_to x, row
-        v.line_to x2, row
-      end
-      v.stroke
     end
   end
 end
 
+class Tilemap < BaseObject
+  field :data,   type: Moon::Table,       default: nil
+  field :sprite, type: Moon::Spritesheet, default: nil
+
+  def render(rect, options = {})
+    return unless sprite
+    return unless data
+    x, y = rect.x, rect.y
+    w, h = sprite.w, sprite.h
+    data.iter.each_with_xy do |n, dx, dy|
+      next unless n >= 0
+      sprite.render x + dx * w, y + dy * h, 1, n
+    end
+  end
+end
+
+class Cursor < BaseObject
+  field :reso,  type: Moon::Vector2, default: proc { Moon::Vector2.new(8, 8) }
+  field :coord, type: Moon::Vector2, default: proc { Moon::Vector2.zero }
+  field :color, type: NVG::Color
+
+  def render(rect, options = {})
+    vg.draw rect.w, rect.h, 1.0 do
+      vg.stroke_color color
+      vg.path do
+        vg.move_to coord.x * reso.x, coord.y * reso.y
+        vg.rect 1, 1, reso.x - 2, reso.y - 2
+        vg.stroke_width 1
+        vg.stroke
+      end
+    end
+  end
+end
+
+class CursorPosition < BaseObject
+  field :cursor, type: Cursor
+
+  def render(rect, options)
+    vg.draw rect.w, rect.h, 1.0 do
+      vg.fill_color NVG.rgba(32, 32, 32, 64)
+      vg.path do
+        vg.rounded_box 8, 8, 196, 32, 8, 8, 8, 8
+        vg.fill
+      end
+    end
+  end
+end
+
+# Class for hosting other BaseObjects
 class Scene < BaseObject
   # Post initialization
   #
@@ -194,9 +255,27 @@ module States
   class MapEditor < ::State
     def init
       super
+      Renderable.vg ||= NVG::Context.new NVG::ANTIALIAS
       screen.clear_color = Color.mono 107
+
+      reso = Moon::Vector2.new 8, 8
+
+      data = Moon::Table.new 20, 20, default: -1
+      data.map_with_xy { |_, _, _| [32, 33, 34, 35].sample }
+      #pnt = Moon::Painter2.new data
+      #pnt.fill 32
+      tileset = Moon::Spritesheet.new 'resources/world.png', reso.x, reso.y
+
       @scene = Scene.new tags: ['root']
-      @scene.add GridOverlay.new color: NVG.mono(117), tags: ['map_grid']
+      cursor = Cursor.new color: NVG.mono(168), reso: reso, tags: ['map_cursor']
+      map_scene = Scene.new tags: ['map_view']
+      map_scene.add GridOverlay.new color: NVG.mono(117), tags: ['map_grid'], reso: reso
+      map_scene.add Tilemap.new data: data, sprite: tileset
+      map_scene.add cursor
+      @scene.add View.new child: map_scene
+      gui_scene = Scene.new tags: ['gui_view']
+      gui_scene.add CursorPosition.new cursor: cursor
+      @scene.add View.new child: gui_scene
     end
 
     def update(delta)
