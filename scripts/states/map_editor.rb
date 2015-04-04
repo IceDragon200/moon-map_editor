@@ -59,41 +59,58 @@ class Color
   end
 end
 
+module Visibility
+  ##
+  # Is this visible?
+  #
+  # @return [Boolean]
+  def visible?
+    !!visible
+  end
+
+  ##
+  # Is this invisible?
+  #
+  # @return [Boolean]
+  def invisible?
+    !visible
+  end
+
+  ##
+  # Sets visible to false
+  #
+  # @return [self]
+  def hide
+    self.visible = false
+    self
+  end
+
+  ##
+  # Sets visible to true
+  #
+  # @return [self]
+  def show
+    self.visible = true
+    self
+  end
+end
+
 module Renderable
   class << self
     attr_accessor :vg
   end
 
+  include Visibility
+
   def vg
     Renderable.vg
   end
 
-  def render(rect, options = {})
-  end
-end
-
-# Module for adding tagging capabilities to Objects, the object in question
-# must implement a tags accessor, which is normally an Array of Strings.
-module Taggable
-  # Adds new tags to the object
-  #
-  # @param [String] tgs
-  def tag(*tgs)
-    tags.concat tgs
+  def render_content(ctx, rect, options = {})
   end
 
-  # Removes tags from the object
-  #
-  # @param [String] tgs
-  def untag(*tgs)
-    self.tags -= tgs
-  end
-
-  # Checks if the object includes the tags
-  #
-  # @param [String] tgs
-  def tagged?(*tgs)
-    tags.include_slice?(tgs)
+  def render(ctx, rect, options = {})
+    render_content ctx, rect, options if visible?
   end
 end
 
@@ -101,6 +118,7 @@ class BaseObject < Moon::DataModel::Metal
   include Renderable
   include Taggable
 
+  field :visible, type: Boolean, default: true
   array :tags, type: String
 
   def update(delta)
@@ -112,12 +130,12 @@ class View < BaseObject
   field :offset, type: Moon::Vector2, default: proc { Moon::Vector2.zero }
   field :child,  type: Renderable,    default: nil
 
-  def render_content(rect, options = {})
-    @child.render rect, options if @child
+  def render_child(ctx, rect, options = {})
+    @child.render ctx, rect, options if @child
   end
 
-  def render(rect, options = {})
-    render_content rect.translate(offset), options
+  def render_content(ctx, rect, options = {})
+    render_child ctx, rect.translate(offset), options
   end
 end
 
@@ -126,13 +144,14 @@ class GridOverlay < BaseObject
   field :reso,  type: Moon::Vector2, default: proc { Moon::Vector2.new(8, 8) }
   field :color, type: NVG::Color, default: proc { NVG.mono(0) }
 
-  def render(rect, options = {})
+  def render_content(ctx, rect, options = {})
     x, y, w, h = *rect
     x2 = x + w
     y2 = y + h
     cols = w.divceil(reso.x)
     rows = h.divceil(reso.y)
     vg.draw w, h, 1.0 do
+      vg.scale ctx.scale, ctx.scale
       vg.stroke_color @color
       vg.stroke_width 1
       vg.path do
@@ -156,7 +175,7 @@ class Tilemap < BaseObject
   field :data,   type: Moon::Table,       default: nil
   field :sprite, type: Moon::Spritesheet, default: nil
 
-  def render(rect, options = {})
+  def render_content(ctx, rect, options = {})
     return unless sprite
     return unless data
     x, y = rect.x, rect.y
@@ -173,12 +192,13 @@ class Cursor < BaseObject
   field :coord, type: Moon::Vector2, default: proc { Moon::Vector2.zero }
   field :color, type: NVG::Color
 
-  def render(rect, options = {})
+  def render_content(ctx, rect, options = {})
     vg.draw rect.w, rect.h, 1.0 do
       vg.stroke_color color
       vg.path do
-        vg.move_to coord.x * reso.x, coord.y * reso.y
-        vg.rect 1, 1, reso.x - 2, reso.y - 2
+        vg.scale ctx.scale, ctx.scale
+        vg.rect rect.x + coord.x * reso.x + 1, rect.y + coord.y * reso.y + 1,
+                reso.x - 2, reso.y - 2
         vg.stroke_width 1
         vg.stroke
       end
@@ -189,13 +209,16 @@ end
 class CursorPosition < BaseObject
   field :cursor, type: Cursor
 
-  def render(rect, options)
+  def render_content(ctx, rect, options)
     vg.draw rect.w, rect.h, 1.0 do
-      vg.fill_color NVG.rgba(32, 32, 32, 64)
+      vg.fill_color NVG.rgba(32, 32, 32, 128)
       vg.path do
-        vg.rounded_box 8, 8, 196, 32, 8, 8, 8, 8
+        vg.rounded_box rect.x + 8, rect.y + 8, 196, 32, 8, 8, 8, 8
         vg.fill
       end
+      vg.text_align NVG::ALIGN_CENTER | NVG::ALIGN_TOP
+      vg.fill_color NVG.mono(255)
+      vg.text rect.x + (196 / 2), rect.y + 8, cursor.coord.to_s
     end
   end
 end
@@ -243,39 +266,120 @@ class Scene < BaseObject
   # @param [Moon::Rect] rect
   # @param [Hash] options
   # @return [self]
-  def render(rect, options = {})
+  def render_content(ctx, rect, options = {})
     @children.each do |node|
-      node.value.render rect, options
+      node.value.render ctx, rect, options
     end
     self
   end
 end
 
-module States
+class InputReactor < Moon::DataModel::Metal
+  include Reactive::Reactable
+
+  array :listeners, type: Object
+
+  def trigger(event)
+    notify event
+  end
+
+  def on(action, *keys, &block)
+    action_filter = select { |e| e.type == action }.select { |e| e.action == action }
+    keys.each { |key| action_filter.select(block) { |e| e.key == key } }
+  end
+end
+
+class InputPoll < Moon::DataModel::Metal
+  dict :keys, key: Symbol, value: Symbol
+
+  def pressed?(key)
+    keys[key] == :press
+  end
+
+  def repeated?(key)
+    keys[key] == :repeat
+  end
+
+  def released?(key)
+    keys[key] == :release
+  end
+
+  alias :down? :pressed?
+  alias :up? :released?
+end
+
+module States #:nodoc:
+  # Main MapEditor state
   class MapEditor < ::State
     def init
       super
-      Renderable.vg ||= NVG::Context.new NVG::ANTIALIAS
-      screen.clear_color = Color.mono 107
+      Renderable.vg ||= begin
+        ctx = NVG::Context.new NVG::ANTIALIAS
+        ctx.create_font 'vera', 'resources/fonts/vera/Vera.ttf'
+        ctx.font_face 'vera'
+        ctx
+      end
+      create_all
+    end
 
+    private def create_all
       reso = Moon::Vector2.new 8, 8
 
       data = Moon::Table.new 20, 20, default: -1
       data.map_with_xy { |_, _, _| [32, 33, 34, 35].sample }
-      #pnt = Moon::Painter2.new data
-      #pnt.fill 32
       tileset = Moon::Spritesheet.new 'resources/world.png', reso.x, reso.y
 
       @scene = Scene.new tags: ['root']
-      cursor = Cursor.new color: NVG.mono(168), reso: reso, tags: ['map_cursor']
+
+      @cursor = Cursor.new color: NVG.mono(168), reso: reso, tags: ['map_cursor']
       map_scene = Scene.new tags: ['map_view']
       map_scene.add GridOverlay.new color: NVG.mono(117), tags: ['map_grid'], reso: reso
       map_scene.add Tilemap.new data: data, sprite: tileset
-      map_scene.add cursor
+      map_scene.add @cursor
       @scene.add View.new child: map_scene
+
       gui_scene = Scene.new tags: ['gui_view']
-      gui_scene.add CursorPosition.new cursor: cursor
+      gui_scene.add CursorPosition.new cursor: @cursor
       @scene.add View.new child: gui_scene
+
+      register_input
+    end
+
+    def register_input
+      @input = InputReactor.new
+      @input_poll = InputPoll.new
+      @input.case(Moon::InputEvent) { |e| @input_poll.keys[e.key] = e.action }
+      engine.input.register @input
+
+      # So we can close the game.
+      @input.on :press, :escape do
+        engine.quit
+      end
+
+      @input.case(Moon::InputEvent) do |e|
+        v = e.action == :press ? 1 : 0
+        case e.key
+        when :left
+          @cursor.coord.x -= v
+        when :right
+          @cursor.coord.x += v
+        when :up
+          @cursor.coord.y -= v
+        when :down
+          @cursor.coord.y += v
+        end
+      end
+    end
+
+    def start
+      super
+      screen.clear_color = Color.mono 107
+      screen.scale = 4
+    end
+
+    def terminate
+      engine.input.unregister @input
+      super
     end
 
     def update(delta)
@@ -284,7 +388,7 @@ module States
     end
 
     def render
-      @scene.render screen.rect
+      @scene.render screen, screen.rect
       super
     end
   end
